@@ -303,18 +303,20 @@ mod tests {
         // Total detection time = PING_INTERVAL * MAX_MISSED_PINGS
         let total_detection = PING_INTERVAL.as_secs() * MAX_MISSED_PINGS as u64;
 
-        // Should detect within 5 minutes
+        // Expected: 15s × 10 = 150s
+        // Bounds tightened to catch regressions while allowing some flexibility
         assert!(
-            total_detection <= 300,
-            "Total detection time too long: {}s",
+            total_detection <= 180,
+            "Total detection time too long: {}s (expected ~150s)",
             total_detection
         );
 
-        // Should not be faster than TCP keepalive (120s) for network issues
+        // Should be >= TCP keepalive (120s) to avoid duplicate detection
         // TCP keepalive handles network failures; ping handles application issues
         assert!(
-            total_detection >= 60,
-            "Detection time shorter than TCP keepalive, may cause duplicate detection"
+            total_detection >= 120,
+            "Detection time {}s shorter than TCP keepalive (120s)",
+            total_detection
         );
     }
 

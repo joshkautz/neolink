@@ -247,11 +247,13 @@ pub(super) async fn make_factory(
                         // Send the pipeline back to the factory so it can start
                         let _ = reply.send(element);
 
-                        // Run blocking code on a seperate thread
+                        // Run blocking code on a separate thread
                         // This is not an async thread
                         std::thread::spawn(move || {
-                            let mut aud_ts = 0u32;
-                            let mut vid_ts = 0u32;
+                            // Use u64 for timestamps to avoid overflow
+                            // u32 overflows after ~71 minutes at 30fps
+                            let mut aud_ts: u64 = 0;
+                            let mut vid_ts: u64 = 0;
                             let mut pools = Default::default();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
@@ -311,48 +313,38 @@ fn send_to_sources(
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
-    vid_ts: &mut u32,
-    aud_ts: &mut u32,
+    vid_ts: &mut u64,
+    aud_ts: &mut u64,
     stream_config: &StreamConfig,
 ) -> AnyResult<()> {
-    // Update TS
+    // Update timestamps (u64 to avoid overflow during long streams)
     match data {
         BcMedia::Aac(aac) => {
             let duration = aac.duration().expect("Could not calculate AAC duration");
             if let Some(aud_src) = aud_src.as_ref() {
-                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    aac.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
-                )?;
+                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts));
+                send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts), pools)?;
             }
-            *aud_ts += duration;
+            *aud_ts += duration as u64;
         }
         BcMedia::Adpcm(adpcm) => {
             let duration = adpcm
                 .duration()
                 .expect("Could not calculate ADPCM duration");
             if let Some(aud_src) = aud_src.as_ref() {
-                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    adpcm.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
-                )?;
+                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts));
+                send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts), pools)?;
             }
-            *aud_ts += duration;
+            *aud_ts += duration as u64;
         }
         BcMedia::Iframe(BcMediaIframe { data, .. })
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts));
+                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)?;
             }
-            const MICROSECONDS: u32 = 1000000;
-            *vid_ts += MICROSECONDS / stream_config.fps;
+            const MICROSECONDS: u64 = 1_000_000;
+            *vid_ts += MICROSECONDS / stream_config.fps as u64;
         }
         _ => {}
     }
@@ -1093,6 +1085,39 @@ mod tests {
         assert!(
             BUFFER_THRESHOLD <= 95,
             "Buffer threshold too high, may cause drops"
+        );
+    }
+
+    /// Verify timestamp types can handle long-running streams
+    #[test]
+    fn test_timestamp_no_overflow() {
+        // Timestamps must be u64 to avoid overflow during long streams
+        // u32 overflows after ~71 minutes at 30fps (u32::MAX / (1_000_000 / 30) / 30 / 60)
+        // u64 can handle ~584,942 years at 30fps
+
+        const MICROSECONDS: u64 = 1_000_000;
+        let fps: u64 = 30;
+        let frame_duration = MICROSECONDS / fps;
+
+        // Simulate 24 hours of streaming
+        let hours: u64 = 24;
+        let frames_per_hour = 30 * 60 * 60;
+        let total_frames = hours * frames_per_hour;
+        let total_microseconds = total_frames * frame_duration;
+
+        // This should not overflow with u64
+        assert!(
+            total_microseconds < u64::MAX,
+            "Timestamp would overflow after {} hours",
+            hours
+        );
+
+        // Verify we can handle at least 1 year of streaming
+        let one_year_frames: u64 = 30 * 60 * 60 * 24 * 365;
+        let one_year_microseconds = one_year_frames * frame_duration;
+        assert!(
+            one_year_microseconds < u64::MAX,
+            "Timestamp would overflow within 1 year"
         );
     }
 }

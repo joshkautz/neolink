@@ -341,15 +341,16 @@ impl Poller {
                                         let threshold = max_capacity / 10; // 10% remaining
 
                                         if capacity == 0 {
+                                            // Channel at capacity - send will block until space available
                                             warn!(
-                                                "Channel full for msg {} (ID: {}), frame may be dropped",
+                                                "Channel at capacity for msg {} (ID: {}), send will block",
                                                 &msg_num,
                                                 &msg_id
                                             );
                                         } else if capacity <= threshold {
-                                            // Early warning when approaching capacity
+                                            // Early warning when approaching capacity (< 10% remaining)
                                             debug!(
-                                                "Channel filling: {}/{} remaining for msg {} (ID: {})",
+                                                "Channel low: {}/{} for msg {} (ID: {})",
                                                 capacity,
                                                 max_capacity,
                                                 &msg_num,
