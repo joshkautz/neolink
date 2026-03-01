@@ -7,6 +7,7 @@ use log::*;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -39,6 +40,13 @@ const POLL_COMMAND_CAPACITY: usize = 1000;
 /// Capacity for individual subscriber channels
 /// Matches message channel to prevent asymmetric backpressure
 const SUBSCRIBER_CHANNEL_CAPACITY: usize = 500;
+
+/// Interval between subscriber cleanup passes (in seconds)
+///
+/// Cleanup removes closed subscriber channels to free resources.
+/// Running every 5 seconds instead of per-message reduces CPU overhead
+/// from O(n) per frame to O(n) per interval at 30fps video streams.
+const SUBSCRIBER_CLEANUP_INTERVAL_SECS: u64 = 5;
 
 type MsgHandler = dyn 'static + Send + Sync + for<'a> Fn(&'a Bc) -> BoxFuture<'a, Option<Bc>>;
 
@@ -78,6 +86,7 @@ impl BcConnection {
             subscribers: Default::default(),
             sink: sinker.clone(),
             reciever: ReceiverStream::new(poll_commanded),
+            last_cleanup: Instant::now(),
         };
 
         let mut rx_thread = JoinSet::<Result<()>>::new();
@@ -253,21 +262,43 @@ struct Poller {
     subscribers: Subscriber,
     sink: Sender<Result<Bc>>,
     reciever: ReceiverStream<PollCommand>,
+    last_cleanup: Instant,
 }
 
 impl Poller {
     async fn run(&mut self) -> Result<()> {
         let cancel = CancellationToken::new();
         let _dropguard = cancel.clone().drop_guard();
+        let cleanup_interval = std::time::Duration::from_secs(SUBSCRIBER_CLEANUP_INTERVAL_SECS);
+
         while let Some(command) = self.reciever.next().await {
-            // Clean Up subscribers
-            self.subscribers
-                .num
-                .iter_mut()
-                .for_each(|(_, channels)| channels.retain(|_, channel| !channel.is_closed()));
-            self.subscribers
-                .num
-                .retain(|_, channels| !channels.is_empty());
+            // Periodic cleanup of closed subscribers (every N seconds instead of per-message)
+            // This reduces CPU overhead from O(n) per frame to O(n) per interval
+            if self.last_cleanup.elapsed() >= cleanup_interval {
+                let before = self
+                    .subscribers
+                    .num
+                    .values()
+                    .map(|v| v.len())
+                    .sum::<usize>();
+                self.subscribers
+                    .num
+                    .iter_mut()
+                    .for_each(|(_, channels)| channels.retain(|_, channel| !channel.is_closed()));
+                self.subscribers
+                    .num
+                    .retain(|_, channels| !channels.is_empty());
+                let after = self
+                    .subscribers
+                    .num
+                    .values()
+                    .map(|v| v.len())
+                    .sum::<usize>();
+                if before != after {
+                    debug!("Cleaned up {} closed subscriber channels", before - after);
+                }
+                self.last_cleanup = Instant::now();
+            }
             // Handle the command
             match command {
                 PollCommand::Bc(boxed_response) => {
@@ -303,8 +334,18 @@ impl Poller {
                                             _ = cancel.cancelled() => Result::Ok(()),
                                             v = occ(&response) => {
                                                 if let Some(reply) = v {
-                                                    assert!(reply.meta.msg_num == response.meta.msg_num);
-                                                    sink.send(Ok(reply)).await?;
+                                                    // Verify message number matches - log error instead of panic
+                                                    // to keep camera connection alive for ALPR reliability
+                                                    if reply.meta.msg_num != response.meta.msg_num {
+                                                        error!(
+                                                            "Message handler returned wrong msg_num: expected {}, got {}",
+                                                            response.meta.msg_num, reply.meta.msg_num
+                                                        );
+                                                        return Result::Ok(());
+                                                    }
+                                                    if let Err(e) = sink.send(Ok(reply)).await {
+                                                        warn!("Failed to send handler reply: {}", e);
+                                                    }
                                                 }
                                                 Result::Ok(())
                                             }
@@ -351,10 +392,7 @@ impl Poller {
                                             // Early warning when approaching capacity (< 10% remaining)
                                             debug!(
                                                 "Channel low: {}/{} for msg {} (ID: {})",
-                                                capacity,
-                                                max_capacity,
-                                                &msg_num,
-                                                &msg_id
+                                                capacity, max_capacity, &msg_num, &msg_id
                                             );
                                         } else {
                                             trace!(
@@ -365,7 +403,14 @@ impl Poller {
                                                 &msg_id
                                             );
                                         }
-                                        let _ = sender.send(Ok(response)).await;
+                                        if let Err(e) = sender.send(Ok(response)).await {
+                                            // Log frame drops for visibility - important for ALPR
+                                            // to understand why detection rates may drop
+                                            warn!(
+                                                "Frame dropped for msg {} (ID: {}): {}",
+                                                msg_num, msg_id, e
+                                            );
+                                        }
                                     } else {
                                         trace!(
                                             "Ignoring uninteresting message id {} (number: {})",

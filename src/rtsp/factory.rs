@@ -21,6 +21,14 @@ use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
 /// Formula: 512 packets × 1416 bytes/packet ≈ 725KB
 const AUDIO_BUFFER_SIZE: u32 = 512 * 1416;
 
+/// Maximum number of buffer pools to maintain
+///
+/// Buffer pools are keyed by frame size. Video frames typically cluster around
+/// a few common sizes (I-frames ~50-100KB, P-frames ~5-20KB), so 32 pools
+/// should be more than sufficient. This prevents memory leaks from cameras
+/// with highly variable frame sizes.
+const MAX_BUFFER_POOLS: usize = 32;
+
 #[derive(Clone, Debug)]
 pub enum AudioType {
     Aac,
@@ -380,15 +388,19 @@ fn send_to_appsrc(
         }
     }
 
-    // Backpressure handling: wait if buffer is too full before creating and pushing.
-    // This prevents frame drops when clients temporarily can't consume fast enough.
+    // Backpressure handling: brief wait if buffer is too full before pushing.
+    // This gives slow clients a chance to catch up without excessive delays.
+    //
+    // Architecture note: Each RTSP client has their own thread and buffer,
+    // so backpressure on one client does NOT affect other clients.
     //
     // Strategy:
     // - Check buffer level before pushing
     // - If > 90% full, wait with exponential backoff
-    // - Max 5 retries (~310ms total wait)
-    // - If still full after retries, push anyway (may drop or block)
-    const MAX_RETRIES: u32 = 5;
+    // - Max 3 retries (~70ms total wait) - reduced from 5 retries (~310ms)
+    //   to minimize latency impact for time-sensitive applications like ALPR
+    // - If still full after retries, push anyway (GStreamer will handle overflow)
+    const MAX_RETRIES: u32 = 3;
     const INITIAL_WAIT_MS: u64 = 10;
     const BUFFER_THRESHOLD: u64 = 90; // Percent
 
@@ -409,28 +421,50 @@ fn send_to_appsrc(
             MAX_RETRIES
         );
         std::thread::sleep(std::time::Duration::from_millis(wait_ms));
-        wait_ms *= 2; // Exponential backoff
+        wait_ms *= 2; // Exponential backoff: 10, 20, 40ms = 70ms max
     }
 
     if retries >= MAX_RETRIES {
-        log::debug!(
-            "Buffer still {:.0}% full on {} after {} retries, pushing anyway",
-            (appsrc.current_level_bytes() as f64 / max_bytes as f64) * 100.0,
+        // Log at warn level for visibility - indicates client can't keep up
+        log::warn!(
+            "Client {} buffer {:.0}% full after {}ms backpressure, frame may be delayed",
             appsrc.name(),
-            retries
+            (appsrc.current_level_bytes() as f64 / max_bytes as f64) * 100.0,
+            10 + 20 + 40 // Total backpressure wait
         );
     }
 
     let msg_size = data.len();
 
+    // Evict oldest pools if we're at capacity (prevents memory leak)
+    // Remove the smallest pool first - video frames are larger and more important
+    while pools.len() >= MAX_BUFFER_POOLS && !pools.contains_key(&msg_size) {
+        if let Some(&smallest_key) = pools.keys().min() {
+            if let Some(old_pool) = pools.remove(&smallest_key) {
+                log::debug!(
+                    "Evicting buffer pool for size {} (have {} pools, max {})",
+                    smallest_key,
+                    pools.len() + 1,
+                    MAX_BUFFER_POOLS
+                );
+                let _ = old_pool.set_active(false);
+            }
+        }
+    }
+
     // Get or create a pool of this len
     let pool = pools.entry(msg_size).or_insert_with_key(|size| {
+        log::trace!("Creating buffer pool for frame size {} bytes", size);
         let pool = gstreamer::BufferPool::new();
         let mut pool_config = pool.config();
         // Set a max buffers to ensure we don't grow in memory endlessly
         pool_config.set_params(None, (*size) as u32, 8, 32);
-        pool.set_config(pool_config).unwrap();
-        pool.set_active(true).unwrap();
+        if let Err(e) = pool.set_config(pool_config) {
+            log::error!("Failed to configure buffer pool: {}", e);
+        }
+        if let Err(e) = pool.set_active(true) {
+            log::error!("Failed to activate buffer pool: {}", e);
+        }
         pool
     });
 
@@ -1058,11 +1092,12 @@ mod tests {
     #[test]
     fn test_backpressure_constants() {
         // These are defined locally in send_to_appsrc but we can verify the logic
-        const MAX_RETRIES: u32 = 5;
+        // Reduced from 5 retries (310ms) to 3 retries (70ms) for ALPR latency
+        const MAX_RETRIES: u32 = 3;
         const INITIAL_WAIT_MS: u64 = 10;
         const BUFFER_THRESHOLD: u64 = 90;
 
-        // Max total wait time = 10 + 20 + 40 + 80 + 160 = 310ms
+        // Max total wait time = 10 + 20 + 40 = 70ms
         let mut total_wait: u64 = 0;
         let mut wait_ms = INITIAL_WAIT_MS;
         for _ in 0..MAX_RETRIES {
@@ -1070,10 +1105,10 @@ mod tests {
             wait_ms *= 2;
         }
 
-        // Total wait should be under 1 second
+        // Total wait should be under 100ms for ALPR responsiveness
         assert!(
-            total_wait < 1000,
-            "Backpressure total wait too long: {}ms",
+            total_wait <= 100,
+            "Backpressure total wait too long for ALPR: {}ms (max 100ms)",
             total_wait
         );
 
@@ -1086,6 +1121,28 @@ mod tests {
             BUFFER_THRESHOLD <= 95,
             "Buffer threshold too high, may cause drops"
         );
+    }
+
+    /// Verify buffer pool limits prevent memory leaks
+    #[test]
+    fn test_buffer_pool_limits() {
+        // MAX_BUFFER_POOLS limits how many different frame-size pools we maintain
+        // This prevents memory leaks from cameras with variable frame sizes
+        assert!(
+            MAX_BUFFER_POOLS >= 16,
+            "Too few buffer pools, may cause excessive eviction"
+        );
+        assert!(
+            MAX_BUFFER_POOLS <= 64,
+            "Too many buffer pools allowed, memory leak risk"
+        );
+
+        // Video frames typically cluster around a few sizes:
+        // - I-frames: 50-100KB (few different sizes)
+        // - P-frames: 5-20KB (few different sizes)
+        // - Audio: 512-2KB (consistent size)
+        // 32 pools should be more than enough
+        assert_eq!(MAX_BUFFER_POOLS, 32, "Expected 32 buffer pools");
     }
 
     /// Verify timestamp types can handle long-running streams
