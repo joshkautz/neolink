@@ -425,11 +425,27 @@ fn send_to_appsrc(
     }
 
     if retries >= MAX_RETRIES {
-        // Log at warn level for visibility - indicates client can't keep up
+        let is_audio = appsrc.name().as_str().contains("aud");
+        let fill_pct = (appsrc.current_level_bytes() as f64 / max_bytes as f64) * 100.0;
+
+        if is_audio {
+            // Drop audio frames when buffer is full to prevent pipeline collapse.
+            // Audio drops are far less noticeable than the alternative: the buffer
+            // overflows, causing TCP congestion → pipeline flushing → EOF → full
+            // stream reconnection cycle visible to the user.
+            log::debug!(
+                "Dropping audio frame on {} (buffer {:.0}% full) to prevent pipeline collapse",
+                appsrc.name(),
+                fill_pct,
+            );
+            return Ok(());
+        }
+
+        // For video: log warning but continue pushing (video is critical)
         log::warn!(
             "Client {} buffer {:.0}% full after {}ms backpressure, frame may be delayed",
             appsrc.name(),
-            (appsrc.current_level_bytes() as f64 / max_bytes as f64) * 100.0,
+            fill_pct,
             10 + 20 + 40 // Total backpressure wait
         );
     }
