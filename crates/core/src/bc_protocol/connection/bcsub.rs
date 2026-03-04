@@ -50,9 +50,16 @@ impl<'a> BcSubscription<'a> {
 
     pub async fn send(&self, bc: Bc) -> Result<()> {
         if let Some(msg_num) = self.msg_num {
-            assert!(bc.meta.msg_num as u32 == msg_num);
+            if bc.meta.msg_num as u32 != msg_num {
+                log::error!(
+                    "BcSubscription::send msg_num mismatch: expected {}, got {}",
+                    msg_num,
+                    bc.meta.msg_num
+                );
+                return Err(Error::Other("msg_num mismatch in send".into()));
+            }
         } else {
-            log::debug!("Sending message before msg_num has been aquired");
+            log::debug!("Sending message before msg_num has been acquired");
         }
         self.conn.send(bc).await?;
         Ok(())
@@ -62,9 +69,15 @@ impl<'a> BcSubscription<'a> {
         let bc = self.rx.next().await.ok_or(Error::DroppedSubscriber)?;
         if let Ok(bc) = &bc {
             if let Some(msg_num) = self.msg_num {
-                assert!(bc.meta.msg_num as u32 == msg_num);
+                if bc.meta.msg_num as u32 != msg_num {
+                    log::error!(
+                        "BcSubscription::recv msg_num mismatch: expected {}, got {}",
+                        msg_num,
+                        bc.meta.msg_num
+                    );
+                }
             } else {
-                // Leaning number now
+                // Learning number now
                 self.msg_num = Some(bc.meta.msg_num as u32);
             }
         }
@@ -92,11 +105,7 @@ impl<'a> BcSubscription<'a> {
     }
 
     pub fn bcmedia_stream(&'_ mut self, strict: bool) -> impl Stream<Item = Result<BcMedia>> + '_ {
-        let async_read = self
-            .payload_stream()
-            .map(|frame| frame)
-            .into_async_read()
-            .compat();
-        FramedRead::new(async_read, BcMediaCodex::new(strict)).map(|frame| frame)
+        let async_read = self.payload_stream().into_async_read().compat();
+        FramedRead::new(async_read, BcMediaCodex::new(strict))
     }
 }

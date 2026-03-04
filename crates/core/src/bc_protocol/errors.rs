@@ -11,7 +11,7 @@ pub enum Error {
     Io(#[from] std::sync::Arc<std::io::Error>),
 
     /// Raised when fails to parse time from the camera
-    #[error("Error in time coversion: {:?}", _0)]
+    #[error("Error in time conversion: {:?}", _0)]
     TimeRange(#[from] time::error::ComponentRange),
 
     /// Raised when fails to parse time from the camera
@@ -45,7 +45,7 @@ pub enum Error {
     },
 
     /// Raised when the camera responds with a status code over than OK
-    #[error("Camera responded with Service Unavaliable: Msg of type {id} returned code {code}")]
+    #[error("Camera responded with Service Unavailable: Msg of type {id} returned code {code}")]
     CameraServiceUnavailable {
         /// The message ID
         id: u32,
@@ -77,7 +77,7 @@ pub enum Error {
     StreamFinished,
 
     /// Raised when a connection requests shutdown
-    #[error("Connection shuting down")]
+    #[error("Connection shutting down")]
     ConnectionShutdown,
 
     /// Raised when a discovery attempt fails to get a reply
@@ -88,8 +88,8 @@ pub enum Error {
     #[error("BcUDP packet timeout")]
     BcUdpTimeout,
 
-    /// Raised when a BcUdp incomming connection is dropped
-    #[error("BcUDP reciver dropped: {0:?}")]
+    /// Raised when a BcUdp incoming connection is dropped
+    #[error("BcUDP receiver dropped: {0:?}")]
     BcUdpDropReciver(BcUdpDropReciverKind),
 
     /// Raised when a BcUdp outgoing connection is dropped
@@ -108,7 +108,7 @@ pub enum Error {
     #[error("Send Error")]
     TokioBcSendError,
 
-    /// Raised when the TIMEOUT is reach
+    /// Raised when the timeout is reached
     #[error("Timeout")]
     Timeout(#[from] std::sync::Arc<tokio::time::error::Elapsed>),
 
@@ -116,11 +116,11 @@ pub enum Error {
     #[error("TimeoutError")]
     TimeoutError(#[from] tokio::time::error::Error),
 
-    /// Raised when connection is dropped because the timeout is reach
+    /// Raised when connection is dropped because the timeout is reached
     #[error("Dropped connection (Timeout)")]
     TimeoutDisconnected,
 
-    /// Raised when a camera cannot be connected to ay any of the given addresses
+    /// Raised when a camera cannot be connected to at any of the given addresses
     #[error("Cannot contact camera at given address")]
     CannotInitCamera,
 
@@ -136,29 +136,29 @@ pub enum Error {
     #[error("Talk data is not ADPCM")]
     UnknownTalkEncoding,
 
-    /// Raised when dicovery times out waiting for a reply
+    /// Raised when discovery times out waiting for a reply
     #[error("Timed out while waiting for camera reply")]
     DiscoveryTimeout,
 
-    /// Raised during a (de)seralisation error
+    /// Raised during a (de)serialisation error
     #[error("Cookie GenError")]
     GenError(#[from] std::sync::Arc<cookie_factory::GenError>),
 
-    /// Raised when a connection is subscrbed to more than once for msg_num
+    /// Raised when a connection is subscribed to more than once for msg_num
     #[error("Simultaneous subscription, {msg_num:?}")]
     SimultaneousSubscription {
         /// The message number that was subscribed to
         msg_num: Option<u16>,
     },
 
-    /// Raised when a connection is subscrbed to more than once for msg_id
+    /// Raised when a connection is subscribed to more than once for msg_id
     #[error("Simultaneous subscription, {msg_id}")]
     SimultaneousSubscriptionId {
         /// The message number that was subscribed to
         msg_id: u32,
     },
 
-    /// Raised when a new encyrption byte is observed
+    /// Raised when a new encryption byte is observed
     #[error("Unknown encryption: {0:x?}")]
     UnknownEncryption(usize),
 

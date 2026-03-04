@@ -93,7 +93,7 @@ impl StreamConfig {
                             bitrate_table.clone(),
                         ))
                     } else {
-                        Ok(([0, 0], 0, 0, vec![], vec![]))
+                        Ok(([0, 0], 0, 30, vec![], vec![]))
                     }
                 })
             })
@@ -255,47 +255,55 @@ pub(super) async fn make_factory(
                         // Send the pipeline back to the factory so it can start
                         let _ = reply.send(element);
 
-                        // Run blocking code on a separate thread
-                        // This is not an async thread
-                        std::thread::spawn(move || {
-                            // Use u64 for timestamps to avoid overflow
-                            // u32 overflows after ~71 minutes at 30fps
-                            let mut aud_ts: u64 = 0;
-                            let mut vid_ts: u64 = 0;
-                            let mut pools = Default::default();
+                        // Run blocking code on a separate named thread.
+                        // This is not an async thread — it sends frames into GStreamer.
+                        let thread_name = format!("{name}::{stream}::sender");
+                        std::thread::Builder::new()
+                            .name(thread_name.clone())
+                            .spawn(move || {
+                                // Use u64 for timestamps to avoid overflow
+                                // u32 overflows after ~71 minutes at 30fps
+                                let mut aud_ts: u64 = 0;
+                                let mut vid_ts: u64 = 0;
+                                let mut pools = Default::default();
 
-                            log::trace!("{name}::{stream}: Sending buffered frames");
-                            for buffered in buffer.drain(..) {
-                                send_to_sources(
-                                    buffered,
-                                    &mut pools,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
-                                )?;
-                            }
-
-                            log::trace!("{name}::{stream}: Sending new frames");
-                            while let Some(data) = media_rx.blocking_recv() {
-                                let r = send_to_sources(
-                                    data,
-                                    &mut pools,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
-                                );
-                                if let Err(r) = &r {
-                                    log::info!("Failed to send to source: {r:?}");
+                                log::trace!("{name}::{stream}: Sending buffered frames");
+                                for buffered in buffer.drain(..) {
+                                    send_to_sources(
+                                        buffered,
+                                        &mut pools,
+                                        &vid_src,
+                                        &aud_src,
+                                        &mut vid_ts,
+                                        &mut aud_ts,
+                                        &stream_config,
+                                    )?;
                                 }
-                                r?;
-                            }
-                            log::trace!("All media recieved");
-                            AnyResult::Ok(())
-                        });
+
+                                log::trace!("{name}::{stream}: Sending new frames");
+                                while let Some(data) = media_rx.blocking_recv() {
+                                    let r = send_to_sources(
+                                        data,
+                                        &mut pools,
+                                        &vid_src,
+                                        &aud_src,
+                                        &mut vid_ts,
+                                        &mut aud_ts,
+                                        &stream_config,
+                                    );
+                                    if let Err(r) = &r {
+                                        log::info!("Failed to send to source: {r:?}");
+                                    }
+                                    r?;
+                                }
+                                log::trace!("All media received");
+                                AnyResult::Ok(())
+                            })
+                            .unwrap_or_else(|e| {
+                                log::error!("Failed to spawn frame sender thread: {e}");
+                                // Return a dummy handle that does nothing
+                                std::thread::spawn(|| AnyResult::Ok(()))
+                            });
                         AnyResult::Ok(())
                     });
                 }
@@ -328,22 +336,26 @@ fn send_to_sources(
     // Update timestamps (u64 to avoid overflow during long streams)
     match data {
         BcMedia::Aac(aac) => {
-            let duration = aac.duration().expect("Could not calculate AAC duration");
-            if let Some(aud_src) = aud_src.as_ref() {
-                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts));
-                send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts), pools)?;
+            if let Some(duration) = aac.duration() {
+                if let Some(aud_src) = aud_src.as_ref() {
+                    log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts));
+                    send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts), pools)?;
+                }
+                *aud_ts += duration as u64;
+            } else {
+                log::warn!("Skipping AAC frame: could not calculate duration");
             }
-            *aud_ts += duration as u64;
         }
         BcMedia::Adpcm(adpcm) => {
-            let duration = adpcm
-                .duration()
-                .expect("Could not calculate ADPCM duration");
-            if let Some(aud_src) = aud_src.as_ref() {
-                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts));
-                send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts), pools)?;
+            if let Some(duration) = adpcm.duration() {
+                if let Some(aud_src) = aud_src.as_ref() {
+                    log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts));
+                    send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts), pools)?;
+                }
+                *aud_ts += duration as u64;
+            } else {
+                log::warn!("Skipping ADPCM frame: could not calculate duration");
             }
-            *aud_ts += duration as u64;
         }
         BcMedia::Iframe(BcMediaIframe { data, .. })
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
@@ -486,12 +498,18 @@ fn send_to_appsrc(
 
     // Get a buffer from the pool and then copy in the data
     let buf = {
-        let mut new_buf = pool.acquire_buffer(None).unwrap();
-        let gst_buf_mut = new_buf.get_mut().unwrap();
+        let mut new_buf = pool
+            .acquire_buffer(None)
+            .map_err(|e| anyhow!("Failed to acquire buffer from pool: {e:?}"))?;
+        let gst_buf_mut = new_buf
+            .get_mut()
+            .ok_or_else(|| anyhow!("Failed to get mutable buffer reference"))?;
         let time = ClockTime::from_useconds(ts.as_micros() as u64);
         gst_buf_mut.set_dts(time);
         gst_buf_mut.set_pts(time);
-        let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
+        let mut gst_buf_data = gst_buf_mut
+            .map_writable()
+            .map_err(|e| anyhow!("Failed to map buffer writable: {e:?}"))?;
         gst_buf_data.copy_from_slice(data.as_slice());
         drop(gst_buf_data);
         new_buf
@@ -519,11 +537,15 @@ fn send_to_appsrc(
     if appsrc.current_level_bytes() >= appsrc.max_bytes() * 2 / 3
         && matches!(appsrc.current_state(), gstreamer::State::Paused)
     {
-        appsrc.set_state(gstreamer::State::Playing).unwrap();
+        if let Err(e) = appsrc.set_state(gstreamer::State::Playing) {
+            log::error!("Failed to set appsrc to Playing: {e:?}");
+        }
     } else if appsrc.current_level_bytes() <= appsrc.max_bytes() / 3
         && matches!(appsrc.current_state(), gstreamer::State::Playing)
     {
-        appsrc.set_state(gstreamer::State::Paused).unwrap();
+        if let Err(e) = appsrc.set_state(gstreamer::State::Paused) {
+            log::error!("Failed to set appsrc to Paused: {e:?}");
+        }
     }
     Ok(())
 }

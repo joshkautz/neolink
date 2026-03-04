@@ -104,7 +104,7 @@ impl NeoInstance {
                             if let Some(noti) = noti {
                                 if noti.message.contains("Motion Alert from") {
                                     log::info!(
-                                        "{thread_name}::{stream:?}: Push Notification Recieved"
+                                        "{thread_name}::{stream:?}: Push Notification Received"
                                     );
                                     let mut new_pn_permit = pn_permit.subscribe();
                                     new_pn_permit.activate().await?;
@@ -157,7 +157,7 @@ impl NeoInstance {
                             },
                             v = tasks.next() => {
                                 log::debug!("Task failed: {v:?}");
-                                Err(anyhow!("Task ended prematurly: {v:?}"))
+                                Err(anyhow!("Task ended prematurely: {v:?}"))
                             }
                         }?;
                         log::debug!("Pausing stream");

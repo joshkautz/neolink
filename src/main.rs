@@ -4,10 +4,10 @@
 //!
 //! # Neolink
 //!
-//! Neolink is a small program that acts a general contol interface for Reolink IP cameras.
+//! Neolink is a small program that acts as a general control interface for Reolink IP cameras.
 //!
 //! It contains sub commands for running an rtsp proxy which can be used on Reolink cameras
-//! that do not nativly support RTSP.
+//! that do not natively support RTSP.
 //!
 //! This program is free software: you can redistribute it and/or modify it under the terms of the
 //! GNU General Public License as published by the Free Software Foundation, either version 3 of
@@ -20,7 +20,7 @@
 //! You should have received a copy of the GNU General Public License along with this program. If
 //! not, see <https://www.gnu.org/licenses/>.
 //!
-//! Neolink source code is available online at <https://github.com/QuantumEntangledAndy/neolink>
+//! Neolink source code is available online at <https://github.com/joshkautz/neolink>
 //!
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
